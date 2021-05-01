@@ -20,6 +20,7 @@
 #include "converter_impl.hpp"
 #include "logging.hpp"
 #include "spirv_module.hpp"
+#include <type_traits>
 
 namespace dxil_spv
 {
@@ -243,7 +244,8 @@ bool emit_unary_instruction(Converter::Impl &impl, const llvm::UnaryOperator *in
 	return true;
 }
 
-static bool emit_boolean_trunc_instruction(Converter::Impl &impl, const llvm::CastInst *instruction)
+template <typename InstructionType>
+static uint32_t emit_boolean_trunc_instruction(Converter::Impl &impl, const InstructionType *instruction)
 {
 	auto &builder = impl.builder();
 	Operation *op = impl.allocate(spv::OpINotEqual, instruction);
@@ -270,10 +272,11 @@ static bool emit_boolean_trunc_instruction(Converter::Impl &impl, const llvm::Ca
 	}
 
 	impl.add(op);
-	return true;
+	return op->id;
 }
 
-static bool emit_boolean_convert_instruction(Converter::Impl &impl, const llvm::CastInst *instruction, bool is_signed)
+template <typename InstructionType>
+static uint32_t emit_boolean_convert_instruction(Converter::Impl &impl, const InstructionType *instruction, bool is_signed)
 {
 	auto &builder = impl.builder();
 	spv::Id const_0;
@@ -327,10 +330,11 @@ static bool emit_boolean_convert_instruction(Converter::Impl &impl, const llvm::
 	op->add_id(impl.get_id_for_value(instruction->getOperand(0)));
 	op->add_ids({ const_1, const_0 });
 	impl.add(op);
-	return true;
+	return op->id;
 }
 
-static bool emit_masked_cast_instruction(Converter::Impl &impl, const llvm::CastInst *instruction, spv::Op opcode)
+template <typename InstructionType>
+static uint32_t emit_masked_cast_instruction(Converter::Impl &impl, const InstructionType *instruction, spv::Op opcode)
 {
 	auto logical_output_bits = instruction->getType()->getIntegerBitWidth();
 	auto logical_input_bits = instruction->getOperand(0)->getType()->getIntegerBitWidth();
@@ -344,7 +348,7 @@ static bool emit_masked_cast_instruction(Converter::Impl &impl, const llvm::Cast
 		spv::Id extended_id = build_naturally_extended_value(impl, instruction->getOperand(0), logical_bits,
 		                                                     opcode == spv::OpSConvert);
 		impl.value_map[instruction] = extended_id;
-		return true;
+		return extended_id;
 	}
 	else if (physical_input_bits != logical_input_bits)
 	{
@@ -353,13 +357,14 @@ static bool emit_masked_cast_instruction(Converter::Impl &impl, const llvm::Cast
 		mask_op->add_id(build_naturally_extended_value(impl, instruction->getOperand(0), logical_bits,
 		                                               opcode == spv::OpSConvert));
 		impl.add(mask_op);
-		return true;
+		return mask_op->id;
 	}
 
-	return false;
+	return 0;
 }
 
-bool emit_cast_instruction(Converter::Impl &impl, const llvm::CastInst *instruction)
+template <typename InstructionType>
+static uint32_t emit_cast_instruction_impl(Converter::Impl &impl, const InstructionType *instruction)
 {
 	spv::Op opcode;
 	bool signed_input = false;
@@ -375,24 +380,24 @@ bool emit_cast_instruction(Converter::Impl &impl, const llvm::CastInst *instruct
 			return emit_boolean_convert_instruction(impl, instruction, true);
 		opcode = spv::OpSConvert;
 		signed_input = true;
-		if (emit_masked_cast_instruction(impl, instruction, opcode))
-			return true;
+		if (spv::Id id = emit_masked_cast_instruction(impl, instruction, opcode))
+			return id;
 		break;
 
 	case llvm::CastInst::CastOps::ZExt:
 		if (instruction->getOperand(0)->getType()->getIntegerBitWidth() == 1)
 			return emit_boolean_convert_instruction(impl, instruction, false);
 		opcode = spv::OpUConvert;
-		if (emit_masked_cast_instruction(impl, instruction, opcode))
-		    return true;
+		if (spv::Id id = emit_masked_cast_instruction(impl, instruction, opcode))
+		    return id;
 		break;
 
 	case llvm::CastInst::CastOps::Trunc:
 		if (instruction->getType()->getIntegerBitWidth() == 1)
 			return emit_boolean_trunc_instruction(impl, instruction);
 		opcode = spv::OpUConvert;
-		if (emit_masked_cast_instruction(impl, instruction, opcode))
-			return true;
+		if (spv::Id id = emit_masked_cast_instruction(impl, instruction, opcode))
+			return id;
 		break;
 
 	case llvm::CastInst::CastOps::FPTrunc:
@@ -423,7 +428,7 @@ bool emit_cast_instruction(Converter::Impl &impl, const llvm::CastInst *instruct
 
 	default:
 		LOGE("Unknown cast operation.\n");
-		return false;
+		return 0;
 	}
 
 	if (instruction->getType()->getTypeID() == llvm::Type::TypeID::PointerTyID)
@@ -452,14 +457,22 @@ bool emit_cast_instruction(Converter::Impl &impl, const llvm::CastInst *instruct
 		impl.llvm_value_actual_type[instruction] = value_type;
 		impl.handle_to_storage_class[instruction] = storage;
 		impl.add(op);
+		LOGE("op->id: %d\n", op->id);
+		return op->id;
 	}
 	else
 	{
 		Operation *op = impl.allocate(opcode, instruction);
 		op->add_id(build_naturally_extended_value(impl, instruction->getOperand(0), signed_input));
 		impl.add(op);
+		LOGE("op->id2: %d\n", op->id);
+		return op->id;
 	}
-	return true;
+}
+
+bool emit_cast_instruction(Converter::Impl &impl, const llvm::CastInst *instruction)
+{
+	return !!emit_cast_instruction_impl(impl, instruction);
 }
 
 static bool elementptr_is_nonuniform(const llvm::GetElementPtrInst *inst)
@@ -534,12 +547,33 @@ static uint32_t build_constant_getelementptr(Converter::Impl &impl, const llvm::
 	return op->id;
 }
 
-static uint32_t build_constant_expression(Converter::Impl &impl, const llvm::ConstantExpr *cexpr)
+static uint32_t build_constant_cast(Converter::Impl &impl, const llvm::ConstantExpr *cexpr)
 {
+	return emit_cast_instruction_impl(impl, cexpr);
+}
+
+uint32_t build_constant_expression(Converter::Impl &impl, const llvm::ConstantExpr *cexpr)
+{
+	impl.current_constant_expr = cexpr;
 	switch (cexpr->getOpcode())
 	{
 	case llvm::Instruction::GetElementPtr:
 		return build_constant_getelementptr(impl, cexpr);
+
+	case llvm::Instruction::Trunc:
+	case llvm::Instruction::ZExt:
+	case llvm::Instruction::SExt:
+	case llvm::Instruction::FPToUI:
+	case llvm::Instruction::FPToSI:
+	case llvm::Instruction::UIToFP:
+	case llvm::Instruction::SIToFP:
+	case llvm::Instruction::FPTrunc:
+	case llvm::Instruction::FPExt:
+	case llvm::Instruction::PtrToInt:
+	case llvm::Instruction::IntToPtr:
+	case llvm::Instruction::BitCast:
+	case llvm::Instruction::AddrSpaceCast:
+		return build_constant_cast(impl, cexpr);
 
 	default:
 	{
@@ -621,15 +655,7 @@ bool emit_load_instruction(Converter::Impl &impl, const llvm::LoadInst *instruct
 		Operation *op = impl.allocate(spv::OpLoad, instruction);
 
 		auto *ptr = instruction->getPointerOperand();
-		if (auto *cexpr = llvm::dyn_cast<llvm::ConstantExpr>(ptr))
-		{
-			if (spv::Id id = build_constant_expression(impl, cexpr))
-				op->add_id(id);
-			else
-				return false;
-		}
-		else
-			op->add_id(impl.get_id_for_value(ptr));
+		op->add_id(impl.get_id_for_value(ptr));
 
 		impl.add(op);
 	}
@@ -641,15 +667,7 @@ bool emit_store_instruction(Converter::Impl &impl, const llvm::StoreInst *instru
 	Operation *op = impl.allocate(spv::OpStore);
 
 	auto *ptr = instruction->getOperand(1);
-	if (auto *cexpr = llvm::dyn_cast<llvm::ConstantExpr>(ptr))
-	{
-		if (spv::Id id = build_constant_expression(impl, cexpr))
-			op->add_id(id);
-		else
-			return false;
-	}
-	else
-		op->add_id(impl.get_id_for_value(ptr));
+	op->add_id(impl.get_id_for_value(ptr));
 
 	auto itr = impl.llvm_value_actual_type.find(instruction->getOperand(1));
 	if (itr != impl.llvm_value_actual_type.end())
@@ -917,15 +935,7 @@ bool emit_cmpxchg_instruction(Converter::Impl &impl, const llvm::AtomicCmpXchgIn
 	Operation *atomic_op = impl.allocate(spv::OpAtomicCompareExchange, builder.makeUintType(32));
 
 	auto *ptr = instruction->getPointerOperand();
-	if (auto *cexpr = llvm::dyn_cast<llvm::ConstantExpr>(ptr))
-	{
-		if (spv::Id id = build_constant_expression(impl, cexpr))
-			atomic_op->add_id(id);
-		else
-			return false;
-	}
-	else
-		atomic_op->add_id(impl.get_id_for_value(ptr));
+	atomic_op->add_id(impl.get_id_for_value(ptr));
 
 	atomic_op->add_ids({ builder.makeUintConstant(spv::ScopeWorkgroup),
 	                     builder.makeUintConstant(0), // Relaxed
@@ -1004,15 +1014,7 @@ bool emit_atomicrmw_instruction(Converter::Impl &impl, const llvm::AtomicRMWInst
 	Operation *op = impl.allocate(opcode, instruction);
 
 	auto *ptr = instruction->getPointerOperand();
-	if (auto *cexpr = llvm::dyn_cast<llvm::ConstantExpr>(ptr))
-	{
-		if (spv::Id id = build_constant_expression(impl, cexpr))
-			op->add_id(id);
-		else
-			return false;
-	}
-	else
-		op->add_id(impl.get_id_for_value(ptr));
+	op->add_id(impl.get_id_for_value(ptr));
 
 	op->add_ids({
 	    builder.makeUintConstant(spv::ScopeWorkgroup),

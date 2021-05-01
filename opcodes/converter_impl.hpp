@@ -113,6 +113,8 @@ struct Converter::Impl
 	spv::Id get_id_for_constant(const llvm::Constant *constant, unsigned forced_width);
 	spv::Id get_id_for_undef(const llvm::UndefValue *undef);
 
+
+
 	bool emit_stage_input_variables();
 	bool emit_stage_output_variables();
 	bool emit_patch_variables();
@@ -411,5 +413,7 @@ struct Converter::Impl
 
 	DXIL::ComponentType get_effective_input_output_type(DXIL::ComponentType type);
 	spv::Id get_effective_input_output_type_id(DXIL::ComponentType type);
+
+	const llvm::ConstantExpr *current_constant_expr = nullptr;
 };
 } // namespace dxil_spv
